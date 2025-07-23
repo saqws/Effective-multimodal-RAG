@@ -2,9 +2,17 @@ pyarrow==21.0.0
 pandas==2.3.1
 pillow==11.3.0
 numpy==2.2.6
-torch==2.7.1+cu118
-transformers @ git+https://github.com/huggingface/transformers@cb39f7dd5ba874ee1859b47283b08cd3a6ab5a0d
 peft==0.13.2
 wandb==0.21.0
 humanize==4.12.3
 psutil==7.0.0
+torch @ https://download.pytorch.org/whl/cu118/torch-*.whl
+torchvision @ https://download.pytorch.org/whl/cu118/torchvision-*.whl
+torchaudio @ https://download.pytorch.org/whl/cu118/torchaudio-*.whl
+git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni-preview
+bitsandbytes==0.46.1
+accelerate
+qwen-omni-utils[decord]
+pillow
+requests
+tqdm
