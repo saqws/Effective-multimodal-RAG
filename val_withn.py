@@ -1,4 +1,4 @@
-import os, math, random
+import os, math, random, json, logging, argparse, time
 from typing import List, Dict
 from torch.optim import AdamW
 import torch, torch.nn.functional as F
@@ -7,11 +7,12 @@ from transformers import (
     Qwen2_5OmniThinkerForConditionalGeneration,
     Qwen2_5OmniProcessor,
     BitsAndBytesConfig,
-    get_linear_schedule_with_warmup
+    get_cosine_schedule_with_warmup
 )
+from collections.abc import Mapping     
 from peft import (
     LoraConfig, get_peft_model,
-    prepare_model_for_kbit_training   
+    prepare_model_for_kbit_training, PeftModel  
 )
 import wandb
 import logging
@@ -21,37 +22,43 @@ logging.getLogger().setLevel(logging.ERROR)
 import json
 import new_dataloader          
 import sys 
-import time
 
 torch.cuda.empty_cache()
 torch.cuda.ipc_collect()
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--lora_ckpt", type=str, default=None,
+                    help="путь к существующему LoRA‑чек‑пойнту (ep3/ и т. д.)")
+args = parser.parse_args()
 
 MODEL_DIR          = "./qwen2_5_omni_7b_4bit"
 DATA_PATH          = "/home/rag/data/COCO"
 TASK_TYPE          = "T-I"          
 BATCH_SIZE         = 15
 NUM_NEG            = 8
-MAX_LEN            = 200
-LR                 = 1e-4
-EPOCHS             = 5
+MAX_LEN            = 512
+LR                 = 2e-4
+EPOCHS             = 9
 TEMP               = 0.03
-TRAIN_LOG_EVERY    = 0.5
+TRAIN_LOG_EVERY    = 0.3
 VAL_EVERY_EPOCHS   = 1
 SAVE_EVERY_EPOCHS  = 1
 DEVICE             = "cuda"
 TOP_KS             = (1, 5, 10)
-VAL_CHUNK          = 512
+VAL_CHUNK          = 100
 
 SYSTEM_MSG = "You are Qwen, a multilingual multimodal assistant."
 SEP        = "[SEP]"
 
 base_dir = "/home/rag/model"
-lora_dir = os.path.join(base_dir, f"lora_checkpoints/{TASK_TYPE}")
-log_dir = os.path.join(base_dir, f"logs/{TASK_TYPE}")
+lora_dir = os.path.join(base_dir, f"lora_checkpoints/{TASK_TYPE}_withn")
+log_dir = os.path.join(base_dir, f"logs/{TASK_TYPE}_withn")
 
 os.makedirs(lora_dir, exist_ok=True)
 os.makedirs(log_dir, exist_ok=True)
+torch.backends.cuda.enable_flash_sdp(True)
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32  = True
 
 INSTRUCTION_SETS = {
     "T-IT": [
@@ -179,8 +186,12 @@ def info_nce_sep(q, pos, neg, k, τ=TEMP):
 
 
 def eos(hidden, ids, pad_id):
+    if isinstance(pad_id, torch.Tensor):
+        pad_id = pad_id.to(ids.device)  # переместим на тот же девайс
+
     idx = (ids != pad_id).sum(-1) - 1
     return hidden[torch.arange(hidden.size(0), device=hidden.device), idx]
+
 
 
 # def recall_f1_at5(sims):
@@ -199,6 +210,13 @@ class Trainer:
                                  bnb_4bit_quant_type="nf4")
         
         self.proc = Qwen2_5OmniProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
+        self.proc.image_processor.size        = {"height": 224, "width": 224}
+        self.proc.image_processor.max_pixels  = 224 * 224          # 50 176
+        self.proc.image_processor.min_pixels  = 1                  # защитное
+        self.proc.image_processor.longest_edge = 224               # для косых вызовов
+        self.proc.image_processor.shortest_edge = 224
+        self.proc.image_processor.do_resize   = True               # убедимся, что ресайз включён
+        self.proc.image_processor.resample    = 3 
         
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             MODEL_DIR, quantization_config=bnb,
@@ -206,12 +224,18 @@ class Trainer:
         
         self.model = prepare_model_for_kbit_training(self.model,use_gradient_checkpointing=True)
         
-        lora_cfg = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,
+        lora_cfg = LoraConfig(r=12, lora_alpha=36, lora_dropout=0.05,
                               bias="none", task_type="CAUSAL_LM",
                               target_modules=["q_proj","k_proj","v_proj","o_proj",
                                               "gate_proj","up_proj","down_proj"])
         
-        self.model = get_peft_model(self.model, lora_cfg)
+        if args.lora_ckpt and os.path.isdir(args.lora_ckpt):
+            self.model = PeftModel.from_pretrained(self.model, args.lora_ckpt,is_trainable=True)
+            print(f"LoRA‑адаптер загружен из {args.lora_ckpt}")
+        else:
+            self.model = get_peft_model(self.model, lora_cfg)
+            print("Инициализирован новый LoRA‑адаптер")
+        
         assert any("lora" in n for n, p in self.model.named_parameters() if p.requires_grad), "LoRA layers were not attached — check target_modules list!"
 
         for name, param in self.model.named_parameters():
@@ -223,7 +247,7 @@ class Trainer:
 
         full_loader = new_dataloader.create_multimodal_dataloader(
             DATA_PATH, TASK_TYPE, BATCH_SIZE, shuffle=True,
-            num_negatives=NUM_NEG, dataset_percents = 0.001
+            num_negatives=NUM_NEG, dataset_percents = 0.01
 )
         val_len = max(1, int(0.1 * len(full_loader.dataset)))
         train_len = len(full_loader.dataset) - val_len
@@ -237,24 +261,40 @@ class Trainer:
                                     num_workers=4, collate_fn=collate)
 
         self.opt = AdamW(self.model.parameters(), lr=LR, weight_decay=1e-4)
-        steps = len(self.tr_loader)*EPOCHS
-        total_steps = len(self.tr_loader) * EPOCHS
-        warmup_steps = int(total_steps * 0.06)
 
-        self.sched = get_linear_schedule_with_warmup(
-            self.opt,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
-        )
+        total_steps  = len(self.tr_loader) * EPOCHS
+        warmup_steps = int(total_steps * 0.10)
+        self.sched = get_cosine_schedule_with_warmup(
+            self.opt, warmup_steps, total_steps)
 
         # wandb.init(project="gme-qwen-omni7b",
         #            name=f"{TASK_TYPE}_LoRA", config=dict(bs=BATCH_SIZE, k=NUM_NEG))
 
     def _embed(self, pack):
-        pack = {k: v.to(DEVICE) for k, v in pack.items()}  
+
+        def move_to_device(x):
+            if isinstance(x, torch.Tensor):
+                return x.to(DEVICE, non_blocking=True)
+
+            # BatchEncoding, dict, UserDict – всё, что поддерживает .items()
+            elif isinstance(x, Mapping):
+                return {k: move_to_device(v) for k, v in x.items()}
+
+            elif isinstance(x, list):
+                return [move_to_device(v) for v in x]
+
+            else:
+                return x
+
+
+        pack = move_to_device(pack)
+
         out = self.model(**pack, output_hidden_states=True,
-                         use_cache=False, return_dict=True)
+                        use_cache=False, return_dict=True)
+
         return eos(out.hidden_states[-1], pack["input_ids"], self.pad)
+
+
     
     @staticmethod      
     def gpu_report(tag):
@@ -346,6 +386,12 @@ class Trainer:
                 "lr": self.sched.get_last_lr()[0],
             }
             # log.update(self.gpu_report("train_"))
+            
+            if ep % SAVE_EVERY_EPOCHS == 0:
+                model_path = os.path.join(lora_dir, f"ep{ep}")
+                os.makedirs(model_path, exist_ok=True)
+                self.model.save_pretrained(model_path)
+            
             if ep % VAL_EVERY_EPOCHS == 0:
                     Q, D, rel = self._build_val_index()
                     val = self._metrics(Q, D, rel)
@@ -354,10 +400,6 @@ class Trainer:
                     del Q, D, rel; torch.cuda.empty_cache()
 
             if ep % SAVE_EVERY_EPOCHS == 0:
-                model_path = os.path.join(lora_dir, f"ep{ep}")
-                os.makedirs(model_path, exist_ok=True)
-                self.model.save_pretrained(model_path)
-
                 epoch_log_dir = os.path.join(log_dir, f"ep{ep}")
                 os.makedirs(epoch_log_dir, exist_ok=True)
                 log_path = os.path.join(epoch_log_dir, "log.jsonl")
