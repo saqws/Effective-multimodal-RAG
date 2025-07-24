@@ -1,75 +1,65 @@
-import os
-import math
-import random
-import json
-import logging
-import argparse
+import os, math, random, json, logging, argparse, time
 from typing import List, Dict
-from collections.abc import Mapping
-
-import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
+import torch, torch.nn.functional as F
 from torch.utils.data import DataLoader
-
 from transformers import (
     Qwen2_5OmniThinkerForConditionalGeneration,
     Qwen2_5OmniProcessor,
     BitsAndBytesConfig,
     get_cosine_schedule_with_warmup
 )
+from collections.abc import Mapping
 from peft import (
     LoraConfig, get_peft_model,
     prepare_model_for_kbit_training, PeftModel
 )
-
-import humanize
-import new_dataloader
-import shutil
-
+import wandb
+import logging
+import humanize, psutil
 logging.getLogger().setLevel(logging.ERROR)
 
-# ===================== ARGS =====================
+import json
+import new_dataloader
+import sys
+
+torch.cuda.empty_cache()
+torch.cuda.ipc_collect()
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--lora_ckpt", type=str, default=None,
-                    help="путь к существующему LoRA‑чек‑пойнту (ep3/ и т. д.)")
+                    help="путь к существующему LoRA‑чек‑пойнту (ep3/ и т. д.)")
 args = parser.parse_args()
 
-# ===================== CONST =====================
 MODEL_DIR          = "./qwen2_5_omni_7b_4bit"
 DATA_PATH          = "/home/rag/data/COCO"
 TASK_TYPE          = "T-I"
-
 BATCH_SIZE         = 15
 NUM_NEG            = 8
 MAX_LEN            = 512
 LR                 = 2e-4
 EPOCHS             = 9
-TEMP               = 0.05
-
+TEMP               = 0.09
+TRAIN_LOG_EVERY    = 0.05
 VAL_EVERY_EPOCHS   = 1
+SAVE_EVERY_EPOCHS  = 1
 DEVICE             = "cuda"
 TOP_KS             = (1, 5, 10)
 VAL_CHUNK          = 100
 
-# лог/сейв раз в 1/3 эпохи (по шагам)
-LOG_EVERY_FRACTION = 5
-
 SYSTEM_MSG = "You are Qwen, a multilingual multimodal assistant."
 SEP        = "[SEP]"
 
-base_dir  = "/home/rag/model"
-lora_dir  = os.path.join(base_dir, f"saves/lora_checkpoints/{TASK_TYPE}_withn")
-log_dir   = os.path.join(base_dir, f"saves/logs/{TASK_TYPE}_withn")
+base_dir = "/home/rag/model"
+lora_dir = os.path.join(base_dir, f"lora_checkpoints/{TASK_TYPE}_withn")
+log_dir = os.path.join(base_dir, f"logs/{TASK_TYPE}_withn")
 
 os.makedirs(lora_dir, exist_ok=True)
-os.makedirs(log_dir,  exist_ok=True)
-
+os.makedirs(log_dir, exist_ok=True)
 torch.backends.cuda.enable_flash_sdp(True)
-torch.cuda.empty_cache()
-torch.cuda.ipc_collect()
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32  = True
 
-# ===================== PROMPTS =====================
 INSTRUCTION_SETS = {
     "T-IT": [
         "Find an image that matches the given caption.",
@@ -102,14 +92,70 @@ INSTRUCTION_SETS = {
         "Given a query, retrieve relevant entity descriptions."
     ]
 }
+
 INSTRUCTIONS = INSTRUCTION_SETS.get(TASK_TYPE, ["Answer the question."])
 
-DEBUG = False
-PRINT_FIRST_N = 1
+# ==== DEBUG helpers ====
+DEBUG = True
+PRINT_FIRST_N = 1  # сколько первых элементов батча печатаем "как есть"
 
-# ===================== UTILS =====================
+def _tensor_stats(t: torch.Tensor):
+    if t.numel() == 0:
+        return dict(numel=0, shape=tuple(t.shape), device=str(t.device), dtype=str(t.dtype), requires_grad=t.requires_grad)
+    d = {
+        "shape": tuple(t.shape),
+        "device": str(t.device),
+        "dtype": str(t.dtype),
+        "requires_grad": t.requires_grad,
+        "norm2": float(t.float().norm().item()),
+    }
+    if t.is_floating_point():
+        d.update({
+            "min": float(t.min().item()),
+            "max": float(t.max().item()),
+            "mean": float(t.mean().item()),
+        })
+    else:
+        d.update({
+            "min": int(t.min().item()),
+            "max": int(t.max().item()),
+            "mean": None,
+        })
+    return d
+
+def _print_tensor(name: str, t: torch.Tensor):
+    try:
+        s = _tensor_stats(t)
+    except Exception as e:
+        print(f"[T] {name}: <error while reading stats: {e}>")
+        return
+    print(f"[T] {name}: {s}")
+
+def _print_pack(name: str, pack: Mapping):
+    print(f"\n===== PACK: {name} =====")
+    for k, v in pack.items():
+        if isinstance(v, torch.Tensor):
+            _print_tensor(k, v)
+        else:
+            # transformers BatchEncoding может быть маппингом списков/тензоров
+            print(f"[?] {k}: type={type(v)}")
+    print("========================\n")
+
+def _print_loss_vars(q, p, n, logits, labels, loss, τ):
+    print("\n===== LOSS VARS =====")
+    _print_tensor("q", q)
+    _print_tensor("p", p)
+    _print_tensor("n", n)
+    _print_tensor("logits", logits)
+    _print_tensor("labels", labels)
+    print(f"τ (temp): {τ}")
+    print(f"loss: {float(loss.item())}")
+    print("=====================\n")
+# =======================
+
 
 def build_collate(proc: Qwen2_5OmniProcessor):
+
     def make_prompt(text: str) -> str:
         conv = [
             {"role": "system",
@@ -118,7 +164,9 @@ def build_collate(proc: Qwen2_5OmniProcessor):
              "content": [{"type": "text", "text": text}]},
         ]
         prompt = proc.apply_chat_template(
-            conv, add_generation_prompt=False, tokenize=False
+            conv,
+            add_generation_prompt=False,
+            tokenize=False,
         )
         if isinstance(prompt, list):
             prompt = "".join(prompt)
@@ -135,21 +183,32 @@ def build_collate(proc: Qwen2_5OmniProcessor):
         neg_prompts, neg_imgs = [], []
 
         for sample in batch:
+
             instr    = random.choice(INSTRUCTIONS)
             user_msg = f"{instr} {SEP} {sample['input_text'] or ''}"
             q_prompts.append(make_prompt(user_msg))
             q_imgs.append(sample["input_image"])
 
-            pos_txt = sample.get("pos_text") or ""
-            pos_prompts.append(make_prompt(pos_txt))
+            pos_prompts.append(make_prompt(sample["pos_text"]))
             pos_imgs.append(sample["pos_image"])
 
+            n_texts = sample['neg_texts'][:NUM_NEG]
+            n_imgs  = sample['neg_images'][:NUM_NEG]
             tgt_has_text = 'T' in instr.split('-')[-1]
             if tgt_has_text:
                 n_texts = sample['neg_texts'][:NUM_NEG]
             else:
                 n_texts = [""] * NUM_NEG
 
+            n_imgs = sample['neg_images'][:NUM_NEG]
+
+            # NOTE: у вас neg_prompts длины B*NUM_NEG, но neg_imgs вы не расширяли.
+            # Если нужны и картинки, нужно так же заполнять neg_imgs (закомментировано, если не надо):
+            # for txt, img in zip(n_texts, n_imgs):
+            #     neg_prompts.append(make_prompt(_to_str(txt)))
+            #     neg_imgs.append(img)
+
+            # Если изображения не нужны (T-I), то можно оставить images=None, тогда neg_imgs пустой.
             for txt in n_texts:
                 neg_prompts.append(make_prompt(_to_str(txt)))
 
@@ -164,11 +223,21 @@ def build_collate(proc: Qwen2_5OmniProcessor):
                       return_tensors="pt")
 
         neg_in = proc(text=neg_prompts,
-                      images=None,
+                      images=neg_imgs if any(neg_imgs) else None,
                       padding=True, truncation=True, max_length=MAX_LEN,
                       return_tensors="pt")
 
-        return {"query": q_in, "pos": pos_in, "neg": neg_in}
+        # Вернём тексты для отладки
+        return {
+            "query": q_in,
+            "pos": pos_in,
+            "neg": neg_in,
+            "meta": {
+                "q_prompts": q_prompts[:PRINT_FIRST_N],
+                "pos_prompts": pos_prompts[:PRINT_FIRST_N],
+                "neg_prompts": neg_prompts[:PRINT_FIRST_N],
+            }
+        }
     return collate
 
 def info_nce_sep(q, pos, neg, k, τ=TEMP):
@@ -182,32 +251,23 @@ def info_nce_sep(q, pos, neg, k, τ=TEMP):
 
     labels = torch.zeros(q.size(0), dtype=torch.long, device=q.device)
     loss = F.cross_entropy(logits / τ, labels)
-    return loss, logits
+    return loss, logits, labels
+
 
 def eos(hidden, ids, pad_id):
     if isinstance(pad_id, torch.Tensor):
-        pad_id = pad_id.to(ids.device)
+        pad_id = pad_id.to(ids.device)  # переместим на тот же девайс
+
     idx = (ids != pad_id).sum(-1) - 1
     return hidden[torch.arange(hidden.size(0), device=hidden.device), idx]
 
-# ===================== TRAINER =====================
+
 class Trainer:
     def __init__(self):
-        # --- dirs for overwriting checkpoints ---
-        self.ckpt_epoch_dir = os.path.join(lora_dir, "epoch_last")
-        self.ckpt_step_dir  = os.path.join(lora_dir, "step_last")
-        os.makedirs(self.ckpt_epoch_dir, exist_ok=True)
-        os.makedirs(self.ckpt_step_dir,  exist_ok=True)
-
-        # --- глобальный файл шагов, который перезаписываем всегда ---
-        self.step_live_path = os.path.join(log_dir, "step_live.json")
-
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
-        )
+        bnb = BitsAndBytesConfig(load_in_4bit=True,
+                                 bnb_4bit_compute_dtype=torch.float16,
+                                 bnb_4bit_use_double_quant=True,
+                                 bnb_4bit_quant_type="nf4")
 
         self.proc = Qwen2_5OmniProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
         self.proc.image_processor.size        = {"height": 224, "width": 224}
@@ -220,17 +280,20 @@ class Trainer:
 
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             MODEL_DIR, quantization_config=bnb,
-            device_map="auto", torch_dtype=torch.float16, local_files_only=True
-        )
+            device_map="auto", torch_dtype=torch.float16, local_files_only=True)
+
+        if DEBUG:
+            try:
+                print(">>> model embedding device:", self.model.get_input_embeddings().weight.device)
+            except Exception as e:
+                print(">>> cannot get embedding device:", e)
 
         self.model = prepare_model_for_kbit_training(self.model, use_gradient_checkpointing=True)
 
-        lora_cfg = LoraConfig(
-            r=12, lora_alpha=36, lora_dropout=0.05,
-            bias="none", task_type="CAUSAL_LM",
-            target_modules=["q_proj","k_proj","v_proj","o_proj",
-                            "gate_proj","up_proj","down_proj"]
-        )
+        lora_cfg = LoraConfig(r=12, lora_alpha=36, lora_dropout=0.05,
+                              bias="none", task_type="CAUSAL_LM",
+                              target_modules=["q_proj","k_proj","v_proj","o_proj",
+                                              "gate_proj","up_proj","down_proj"])
 
         if args.lora_ckpt and os.path.isdir(args.lora_ckpt):
             self.model = PeftModel.from_pretrained(self.model, args.lora_ckpt,
@@ -240,12 +303,14 @@ class Trainer:
             self.model = get_peft_model(self.model, lora_cfg)
             print("Инициализирован новый LoRA‑адаптер")
 
+        # 🔍 Проверка, что LoRA веса действительно загружены
         print("\n🧪 Проверка одного LoRA-веса:")
         for name, param in self.model.named_parameters():
             if "lora" in name:
                 print(f"{name} | mean: {param.data.mean().item():.6f}")
                 break
 
+        # ✅ Проверка, что trainable веса присутствуют
         print("\n📌 Trainable параметры:")
         self.model.print_trainable_parameters()
 
@@ -279,31 +344,13 @@ class Trainer:
         total_steps  = len(self.tr_loader) * EPOCHS
         warmup_steps = int(total_steps * 0.10)
         self.sched = get_cosine_schedule_with_warmup(
-            self.opt, warmup_steps, total_steps
-        )
+            self.opt, warmup_steps, total_steps)
 
-    # --------- ЛОГИ ---------
-    def _write_step_live(self, obj: dict):
-        """Перезаписываемый универсальный файл по шагам."""
-        with open(self.step_live_path, "w") as f:
-            json.dump(obj, f, ensure_ascii=False)
+        # wandb.init(project="gme-qwen-omni7b",
+        #            name=f"{TASK_TYPE}_LoRA", config=dict(bs=BATCH_SIZE, k=NUM_NEG))
 
-    def _append_epoch_log(self, epoch: int, obj: dict):
-        """Финальные записи по эпохе (train/val) — в отдельный файл ep{N}/log.jsonl"""
-        ep_log_dir = os.path.join(log_dir, f"ep{epoch}")
-        os.makedirs(ep_log_dir, exist_ok=True)
-        with open(os.path.join(ep_log_dir, "log.jsonl"), "a") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-    def _save_model_overwrite(self, dst_dir: str):
-        if os.path.exists(dst_dir):
-            shutil.rmtree(dst_dir)
-        os.makedirs(dst_dir, exist_ok=True)
-        self.model.save_pretrained(dst_dir)
-        print(f"[CKPT] overwritten -> {dst_dir}")
-
-    # --------- EMBED ---------
     def _embed(self, pack):
+        # Берём девайс, где реально лежат эмбеддинги.
         try:
             input_dev = self.model.get_input_embeddings().weight.device
         except Exception:
@@ -316,18 +363,32 @@ class Trainer:
                 return {k: move_to_device(v, device) for k, v in obj.items()}
             elif isinstance(obj, list):
                 return [move_to_device(v, device) for v in obj]
-            elif hasattr(obj, "to"):
+            elif hasattr(obj, "to"):  # BatchEncoding и т.п.
                 return obj.to(device)
             else:
                 return obj
 
         pack = move_to_device(pack, input_dev)
 
-        out = self.model(**pack, output_hidden_states=True,
-                         use_cache=False, return_dict=True)
+        if DEBUG:
+            _print_pack("INPUT_TO_MODEL", pack)
+            try:
+                print("embed weight device:", self.model.get_input_embeddings().weight.device)
+            except Exception as e:
+                print("cannot print embed weight device:", e)
+
+        out = self.model(**pack,
+                        output_hidden_states=True,
+                        use_cache=False,
+                        return_dict=True)
 
         last = eos(out.hidden_states[-1], pack["input_ids"], self.pad)
+
+        if DEBUG:
+            _print_tensor("eos(last_hidden)", last)
+
         return last
+
 
     @staticmethod
     def gpu_report(tag):
@@ -335,65 +396,56 @@ class Trainer:
         used = total - free
         print(f"{tag} | used {humanize.naturalsize(used)} / {humanize.naturalsize(total)}")
 
-    # --------- TRAIN ---------
     def _train_epoch(self, epoch):
         self.model.train(); torch.set_grad_enabled(True)
         loss_acc = 0.0
-
-        step_period = max(1, len(self.tr_loader) // LOG_EVERY_FRACTION)
+        half_pt = int(len(self.tr_loader) * TRAIN_LOG_EVERY)
 
         for step, b in enumerate(self.tr_loader, 1):
+
+            if DEBUG and isinstance(b, dict) and "meta" in b:
+                print("\n===== RAW TEXTS (first N) =====")
+                print("q_prompts[0]:", b["meta"]["q_prompts"][0] if b["meta"]["q_prompts"] else None)
+                print("pos_prompts[0]:", b["meta"]["pos_prompts"][0] if b["meta"]["pos_prompts"] else None)
+                print("neg_prompts[0]:", b["meta"]["neg_prompts"][0] if b["meta"]["neg_prompts"] else None)
+                print("===============================\n")
+
             q = self._embed(b["query"])
             p = self._embed(b["pos"])
             n = self._embed(b["neg"]).view(q.size(0), NUM_NEG, -1)
 
-            loss, logits = info_nce_sep(q, p, n, NUM_NEG)
+            loss, logits, labels = info_nce_sep(q, p, n, NUM_NEG)
 
-            if (not torch.isfinite(loss)) or loss.item() < 1e-8:
-                reason = "nan_or_inf" if not torch.isfinite(loss) else "zero_loss"
-                print(f"\n[STOP] {reason} at epoch {epoch}, step {step}.")
-                live = {
-                    "task": TASK_TYPE, "epoch": epoch, "step": step,
-                    "loss": float(loss.item()), "reason": reason,
-                    "lr": self.sched.get_last_lr()[0]
-                }
-                self._write_step_live(live)
-                self._save_model_overwrite(self.ckpt_step_dir)
-                break
+            if DEBUG:
+                _print_loss_vars(q, p, n, logits, labels, loss, TEMP)
 
-            self.opt.zero_grad()
-            loss.backward()
+            self.opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.)
             self.opt.step(); self.sched.step()
-            print('.', end='', flush=True)
 
+            if loss.item() < 1e-8:
+                print(f"\n[STOP] Zero loss at epoch {epoch}, step {step}. Saving and breaking.")
+                model_path = os.path.join(lora_dir, f"ep{epoch}")
+                os.makedirs(model_path, exist_ok=True)
+                self.model.save_pretrained(model_path)
+                break
+
+            print('.', end='', flush=True)
             loss_acc += loss.item()
 
-            if (step % step_period == 0) or (step == len(self.tr_loader)):
-                avg_loss = loss_acc / step
-                live = {
-                    "task": TASK_TYPE,
-                    "epoch": epoch,
-                    "step": step,
-                    "loss": float(loss.item()),
-                    "loss_mean_so_far": avg_loss,
-                    "lr": self.sched.get_last_lr()[0],
-                }
-                self._write_step_live(live)
-                self._save_model_overwrite(self.ckpt_step_dir)
+            if step == half_pt or step == len(self.tr_loader):
+                print(f"EP{epoch} step {step}/{len(self.tr_loader)} | "
+                      f"loss {(loss_acc/step):.4f}")
 
-            del q, p, n, logits
-            torch.cuda.empty_cache()
+            del q, p, n, logits, labels; torch.cuda.empty_cache()
 
         n_steps = len(self.tr_loader)
-        return loss_acc / max(n_steps, 1)
+        return loss_acc / n_steps
 
-    # --------- VAL ---------
     @torch.no_grad()
     def _build_val_index(self):
         self.model.eval()
-        Q_list, D_list, rel = [], [], []
-        cursor = 0
+        Q_list,D_list,rel=[],[],[]; cursor=0
         for b in self.val_loader:
             q   = self._embed(b["query"]).cpu()
             pos = self._embed(b["pos"]).cpu()
@@ -402,73 +454,68 @@ class Trainer:
             D_list.extend(pos); rel.extend(range(cursor,cursor+B)); cursor+=B
             D_list.extend(neg); cursor+=neg.size(0)
             Q_list.append(q)
+
             torch.cuda.empty_cache()
 
         Q = F.normalize(torch.cat(Q_list), p=2, dim=1)
         D = F.normalize(torch.stack(D_list), p=2, dim=1).half()
-        return Q, D, torch.tensor(rel)
+        return Q,D,torch.tensor(rel)
 
     @torch.no_grad()
-    def _metrics(self, Q, D, rel):
-        N = Q.size(0)
-        D_gpu = D.T.to(DEVICE)
-        hits = {k: [] for k in TOP_KS}; ranks = []; probs = []
+    def _metrics(self,Q,D,rel):
+        N=Q.size(0)
+        D_gpu= D.T.to(DEVICE)
+        hits={k:[] for k in TOP_KS}; ranks=[]; probs=[]
 
-        for s in range(0, N, VAL_CHUNK):
+        for s in range(0,N,VAL_CHUNK):
             e = min(s + VAL_CHUNK, N)
             sims = Q[s:e].to(DEVICE) @ D_gpu.float()
             soft = F.softmax(sims.float()/TEMP, 1)
             probs.append(soft[torch.arange(e-s), rel[s:e].to(DEVICE)].cpu())
 
-            order = sims.argsort(1, descending=True).cpu()
-            ranks.append(((order == rel[s:e].unsqueeze(1)).nonzero()[:,1]) + 1)
+            order = sims.argsort(1,descending=True).cpu()
+            ranks.append(((order==rel[s:e].unsqueeze(1)).nonzero()[:,1])+1)
 
             for k in TOP_KS:
-                hits[k].append((order[:, :k] == rel[s:e].unsqueeze(1)).any(1).float())
+                hits[k].append((order[:,:k]==rel[s:e].unsqueeze(1)).any(1).float())
+            del sims,soft,order; torch.cuda.empty_cache()
 
-            del sims, soft, order
-            torch.cuda.empty_cache()
-
-        mrr  = (1 / torch.cat(ranks).float()).mean().item()
+        mrr = (1/torch.cat(ranks).float()).mean().item()
         prob = torch.cat(probs).mean().item()
-        out = {"MRR": mrr, "Prob": prob}
+        out = {"MRR":mrr,"Prob":prob}
         for k in TOP_KS:
             r = torch.cat(hits[k]).mean().item()
-            out[f"R@{k}"] = r
+            out[f"R@{k}"]=r
         return out
 
-    # --------- FIT ---------
     def fit(self):
-        for ep in range(1, EPOCHS + 1):
+        for ep in range(1,EPOCHS+1):
             tr_loss = self._train_epoch(ep)
 
-            # Финальный train-лог эпохи
-            ep_log = {
-                "task": TASK_TYPE,
+            log = {
                 "epoch": ep,
                 "train_loss": tr_loss,
                 "lr": self.sched.get_last_lr()[0],
             }
-            self._append_epoch_log(ep, ep_log)
-            self._save_model_overwrite(self.ckpt_epoch_dir)
+
+            if ep % SAVE_EVERY_EPOCHS == 0:
+                model_path = os.path.join(lora_dir, f"ep{ep}")
+                os.makedirs(model_path, exist_ok=True)
+                self.model.save_pretrained(model_path)
 
             if ep % VAL_EVERY_EPOCHS == 0:
-                try:
-                    Q, D, rel = self._build_val_index()
-                    val = self._metrics(Q, D, rel)
-                    ep_log_val = {"task": TASK_TYPE, "epoch": ep, **{f"val_{k}": v for k, v in val.items()}}
-                    print(f"VAL EP{ep}:", {k: f"{v:.4f}" for k, v in val.items()})
-                except Exception as e:
-                    print(f"[VAL-ERROR] ep{ep}: {e}")
-                    ep_log_val = {"task": TASK_TYPE, "epoch": ep, "val_error": str(e)}
-                self._append_epoch_log(ep, ep_log_val)
-                self._save_model_overwrite(self.ckpt_epoch_dir)
+                Q, D, rel = self._build_val_index()
+                val = self._metrics(Q, D, rel)
+                log.update({f"val_{k}": v for k, v in val.items()})
+                print(f"VAL EP{ep}:", {k: f"{v:.4f}" for k, v in val.items()})
+                del Q, D, rel; torch.cuda.empty_cache()
+                epoch_log_dir = os.path.join(log_dir, f"ep{ep}")
+                os.makedirs(epoch_log_dir, exist_ok=True)
+                log_path = os.path.join(epoch_log_dir, "log.jsonl")
 
-                if 'Q' in locals():
-                    del Q, D, rel
-                torch.cuda.empty_cache()
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(log) + "\n")
 
-# ===================== MAIN =====================
 if __name__ == "__main__":
     torch.cuda.set_device(0)
-    Trainer().fit()
+    Trainer().fit(); # wandb.finish()
